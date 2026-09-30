@@ -48,7 +48,11 @@ import {
   pendingDecisions,
   pruneReadIds,
 } from "@/lib/notifications";
-import { canActOnSensor, canAdvanceRequest } from "@/lib/permissions";
+import {
+  canAccessReports,
+  canActOnSensor,
+  canAdvanceRequest,
+} from "@/lib/permissions";
 import { createReport, useReports } from "@/lib/reports-store";
 import {
   CLEAR,
@@ -646,7 +650,7 @@ export function AppStateProvider({
     error: unitsError,
   } = useEquipmentUnits();
   const { items: equipmentHistory } = useEquipmentHistory();
-  const { items: reports } = useReports();
+  const { items: reports } = useReports(canAccessReports(role));
 
   // The third holder, beside the estate and the sensor registry:
   // sensorForEquipment / equipmentForSensor / buildingStats are module
@@ -1263,16 +1267,21 @@ export function AppStateProvider({
       const unit = equipmentUnits.find((u) => u.id === unitId);
       if (!unit) return { ok: false as const, message: "No such unit." };
       const at = new Date().toISOString();
-      const summary = [
-        detail.parts.trim() || "Service carried out",
-        detail.cost.trim(),
-      ]
-        .filter(Boolean)
-        .join(" · ");
       // The form has always collected a cost and only ever written it into the
       // summary. Kept as a number too, so the cost report can see servicing
       // and not just request work.
       const costMmk = parseMmk(detail.cost) ?? undefined;
+      const summary = [
+        detail.parts.trim() || "Service carried out",
+        // Through formatMmk, so a typed 92000 reads back as "92,000 MMK" like
+        // every other amount in the app. A drawer of history rows where one
+        // says "145,000 MMK" and the next says "92000" is the record looking
+        // untrustworthy over a missing comma. Anything that is not a number
+        // is kept exactly as typed rather than dropped.
+        costMmk !== undefined ? formatMmk(costMmk) : detail.cost.trim(),
+      ]
+        .filter(Boolean)
+        .join(" · ");
       const written = await recordServiceWrite(
         unitId,
         {

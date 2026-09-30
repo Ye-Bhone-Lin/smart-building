@@ -18,11 +18,17 @@ import {
 import { toReport } from "@/lib/store-mappers";
 import type { ReportDetail, ReportStatus } from "@/lib/types";
 
-export function useReports() {
+/**
+ * `enabled` is false for Office Staff, who may not read this collection.
+ * Reports is the one subscription app-state holds for a page its role cannot
+ * reach, so it is the one that has to be asked for conditionally.
+ */
+export function useReports(enabled = true) {
   return useLiveCollection(
     collection(db, COLLECTIONS.reports),
     toReport,
     (a, b) => b.generatedAt.localeCompare(a.generatedAt),
+    enabled,
   );
 }
 

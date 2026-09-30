@@ -1,9 +1,8 @@
 rules_version = '2';
 
 // ============================================================================
-// Phase A ships exactly one collection. Everything else is denied by default,
-// so Phase B has to open each collection deliberately rather than inheriting
-// access it was never granted.
+// Every collection is opened deliberately here, and the catch-all at the
+// bottom denies anything not named. Nothing inherits access.
 //
 // The rules are the ONLY thing that actually stops anybody. The client-side
 // route guard in src/components/shell/auth-gate.tsx is there so nobody lands
@@ -42,7 +41,25 @@ service cloud.firestore {
     function myRank()             { return rank(myRole()); }
     function isCeo()              { return myRole() == 'ceo-super-admin'; }
     function mayManageAccounts()  { return myRank() <= 2; }
+    // canAct: everything Office Staff may not do is this same gate.
+    function mayAct()             { return myRank() <= 2; }
     function isSelf(uid)          { return request.auth.uid == uid; }
+
+    // isActor: the mock corpus was written against legacy uids, so a seeded
+    // request submitted by this person still belongs to them.
+    function ownsRequest() {
+      return resource.data.submittedBy == request.auth.uid
+        || (profile().keys().hasAny(['legacyUid'])
+            && resource.data.submittedBy == profile().legacyUid);
+    }
+
+    // The two fields Office Staff may change on their own request: dropping it
+    // before approval, and saying resolved work looks done.
+    function ownEdit() {
+      return ownsRequest()
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['withdrawn', 'verificationRequested']);
+    }
 
     // Mirrors UserDrawer's assignableRoles: a CEO may create Office Staff and
     // Admin Managers but never another CEO; an Admin Manager, Office Staff only.
@@ -58,6 +75,12 @@ service cloud.firestore {
         && (d.role == 'office-staff' ? d.buildingId is string : d.buildingId == null);
     }
 
+    // A profile is always written by somebody else, which means the FIRST one
+    // cannot be written through these rules at all: `isActive()` needs a
+    // profile that does not exist yet. Seeding a fresh project therefore has
+    // to happen before these rules are deployed, or through the console. There
+    // is deliberately no self-create carve-out — Email/Password signup is open,
+    // so one would let anybody sign up and make themselves CEO.
     match /users/{userId} {
       // Everyone reads their own doc — that read IS the identity resolution.
       // Account managers read the whole collection for Administration.
@@ -69,10 +92,14 @@ service cloud.firestore {
         && validUser(request.resource.data);
 
       allow update:
-        // The sign-in stamp. Without this carve-out every sign-in is denied.
+        // What a person may change about themselves: the sign-in stamp, the
+        // two fields Settings edits, and which notifications they have read.
+        // Their role, status, email and building are somebody else's to set —
+        // that is what stops an Admin Manager promoting themselves.
         if (isActive() && isSelf(userId)
              && request.resource.data.diff(resource.data)
-                  .affectedKeys().hasOnly(['lastActiveAt']))
+                  .affectedKeys().hasOnly(
+                    ['lastActiveAt', 'name', 'phone', 'readNotifications']))
         // canEditUser: never yourself; the target's CURRENT role must be one
         // you may touch, and its NEW role one you may assign — so an Admin
         // Manager can neither edit an Admin Manager nor promote anyone into it.
@@ -88,7 +115,120 @@ service cloud.firestore {
       allow delete: if false;
     }
 
-    // Phase B opens these one at a time.
+    // ---- Estate ---------------------------------------------------------
+    //
+    // canManageEstate: the buildings and the rooms under them are the CEO's.
+    // Everyone else reads them, because every building filter in the app is
+    // built on this list.
+
+    match /buildings/{buildingId} {
+      allow read: if isActive();
+      allow write: if isActive() && isCeo();
+
+      match /media/{mediaId} {
+        allow read: if isActive();
+        allow write: if isActive() && isCeo();
+      }
+    }
+
+    match /rooms/{roomId} {
+      allow read: if isActive();
+      allow write: if isActive() && isCeo();
+    }
+
+    // ---- Registries -----------------------------------------------------
+    //
+    // canManageSensorTypes / canManageEquipmentTypes: Admin Manager and CEO.
+
+    match /equipmentTypes/{typeId} {
+      allow read: if isActive();
+      allow write: if isActive() && mayAct();
+    }
+
+    match /sensorTypes/{typeId} {
+      allow read: if isActive();
+      allow write: if isActive() && mayAct();
+    }
+
+    // ---- Devices --------------------------------------------------------
+    //
+    // canActOnSensor: read-only for Office Staff. They see every state and
+    // every reading; changing one is the Admin Manager's or the CEO's.
+
+    match /sensors/{sensorId} {
+      allow read: if isActive();
+      allow write: if isActive() && mayAct();
+    }
+
+    // ---- Asset register -------------------------------------------------
+    //
+    // Equipment is the one place Office Staff act on assets: mark faulty,
+    // take a unit under maintenance, record a service, move it. Only
+    // decommissioning and deletion are closed to them, which is exactly what
+    // canDecommissionEquipment says.
+
+    match /equipmentUnits/{unitId} {
+      allow read: if isActive();
+      allow create: if isActive() && mayAct();
+      allow update: if isActive()
+        && (mayAct() || request.resource.data.condition != 'decommissioned');
+      allow delete: if isActive() && mayAct();
+
+      match /media/{mediaId} {
+        allow read: if isActive();
+        allow write: if isActive();
+      }
+    }
+
+    // A unit's history is written beside the change that caused it and is
+    // never edited afterwards — a register whose past can be rewritten is not
+    // a register. Only the reset script's CEO may clear it.
+    match /equipmentHistory/{eventId} {
+      allow read: if isActive();
+      allow create: if isActive();
+      allow update: if false;
+      allow delete: if isActive() && isCeo();
+    }
+
+    // ---- Requests -------------------------------------------------------
+    //
+    // canAdvanceRequest: moving a request along the board is the Admin
+    // Manager's or the CEO's. Office Staff raise one, withdraw their own
+    // before it is approved, and flag resolved work as done — and those two
+    // fields are the only ones they may touch.
+
+    match /requests/{requestId} {
+      allow read: if isActive();
+      allow create: if isActive();
+      allow update: if isActive() && (mayAct() || ownEdit());
+      allow delete: if false;
+    }
+
+    // ---- Ledgers --------------------------------------------------------
+    //
+    // The Log Book page is Admin Manager and CEO only, but this collection
+    // stays readable by everyone: Historical Records is the same collection
+    // read through a different filter, and Office Staff can reach Records.
+    // The page is a presentation gate, not an authorisation one — see
+    // lib/records.ts. An entry is never edited once written.
+    match /logBook/{entryId} {
+      allow read: if isActive();
+      allow create: if isActive();
+      allow update: if false;
+      allow delete: if isActive() && isCeo();
+    }
+
+    // canAccessReports: Admin Manager and CEO. Unlike the Log Book there is
+    // no second page reading this, so the collection itself is closed.
+    // app-state skips the subscription for Office Staff to match.
+    match /reports/{reportId} {
+      allow read: if isActive() && mayAct();
+      allow create: if isActive() && mayAct();
+      allow update: if false;
+      allow delete: if isActive() && isCeo();
+    }
+
+    // Anything not named above.
     match /{document=**} {
       allow read, write: if false;
     }

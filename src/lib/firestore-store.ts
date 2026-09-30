@@ -42,6 +42,15 @@ export function useLiveCollection<T>(
   query: Query,
   map: (id: string, data: Record<string, unknown>) => T,
   sort?: (a: T, b: T) => number,
+  /**
+   * False when this role may not read the collection at all.
+   *
+   * `firestore.rules` is the enforcement layer, so a collection closed to a
+   * role answers a subscription with permission-denied — which the provider
+   * would surface as a broken shell rather than as the restriction it is.
+   * A role that may not read does not ask.
+   */
+  enabled = true,
 ): { items: T[]; loading: boolean; error: string | null } {
   const [items, setItems] = React.useState<T[]>([]);
   const [loading, setLoading] = React.useState(true);
@@ -51,6 +60,12 @@ export function useLiveCollection<T>(
   // caller's promise that it is stable rather than on the object itself.
   // biome-ignore lint/correctness/useExhaustiveDependencies: query identity changes every render by construction
   React.useEffect(() => {
+    if (!enabled) {
+      setItems([]);
+      setLoading(false);
+      setError(null);
+      return;
+    }
     const unsubscribe = onSnapshot(
       query,
       (snap) => {
@@ -67,7 +82,7 @@ export function useLiveCollection<T>(
       },
     );
     return unsubscribe;
-  }, []);
+  }, [enabled]);
 
   return { items, loading, error };
 }

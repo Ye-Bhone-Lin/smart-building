@@ -97,7 +97,17 @@ copies, and signs in to the account if it already exists.
 ```bash
 pnpm init:project --dry-run    # show what it would do, change nothing
 pnpm init:project --reset      # delete the estate first, then write it again
+pnpm init:project --reset-auth # ... and delete the sign-in accounts too
 ```
+
+`--reset` clears every document but leaves Firebase Auth alone, so the same
+people can still sign in — they just land on "no profile" until the accounts
+are rewritten. `--reset-auth` also removes the Auth records, by signing in as
+each one and asking it to delete itself, which is the only route a client-SDK
+script has. It finds the addresses in the `users` collection, so it can only
+reach accounts whose password is either this run's `INIT_PASSWORD` or the
+`SmartPassword!` the app gives a new account. Anything else is named at the end
+with a link to clear it by hand.
 
 To use your own addresses or password:
 

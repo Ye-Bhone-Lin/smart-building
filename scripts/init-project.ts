@@ -6,6 +6,7 @@
 //   pnpm init:project --dry-run       # say what it would do
 //   pnpm init:project --reset         # wipe the WHOLE database first
 //   pnpm init:project --reset --yes   # ... without being asked to confirm
+//   pnpm init:project --reset-auth    # ... and delete the Auth accounts too
 //
 // Runs under vite-node rather than node so it can import the estate from
 // src/lib/mock-data.ts directly, instead of keeping a second copy that drifts.
@@ -22,15 +23,19 @@ import { readFileSync } from "node:fs";
 import { createInterface } from "node:readline/promises";
 import { initializeApp } from "firebase/app";
 import {
+  connectAuthEmulator,
   createUserWithEmailAndPassword,
+  deleteUser,
   getAuth,
   signInWithEmailAndPassword,
   signOut,
 } from "firebase/auth";
 import {
   collection,
+  connectFirestoreEmulator,
   deleteDoc,
   doc,
+  getDoc,
   getDocs,
   getFirestore,
   serverTimestamp,
@@ -48,9 +53,18 @@ import {
 } from "../src/lib/mock-data";
 
 const DRY_RUN = process.argv.includes("--dry-run");
-const RESET = process.argv.includes("--reset");
+const RESET_AUTH = process.argv.includes("--reset-auth");
+const RESET = process.argv.includes("--reset") || RESET_AUTH;
 
 const PASSWORD = process.env.INIT_PASSWORD ?? "SmartPassword!";
+
+/**
+ * The passwords an account here could have been given: this run's, and the one
+ * the app hands a newly created account (`INITIAL_PASSWORD` in users-store).
+ * Deleting an Auth record needs a signed-in session as that very account, so
+ * the only ones reachable without an admin key are those we can guess.
+ */
+const KNOWN_PASSWORDS = [PASSWORD, "SmartPassword!"];
 
 /** One account per role. Office Staff are scoped to a building; nobody else. */
 const ACCOUNTS = [
@@ -133,6 +147,15 @@ const app = initializeApp({
 });
 const auth = getAuth(app);
 const db = getFirestore(app);
+
+// The same flag the app reads, so `NEXT_PUBLIC_FIREBASE_EMULATORS=1 pnpm
+// init:project` fills the emulator suite rather than the real project — which
+// is how the security rules get exercised without deploying them.
+if (process.env.NEXT_PUBLIC_FIREBASE_EMULATORS === "1") {
+  connectAuthEmulator(auth, "http://127.0.0.1:9099", { disableWarnings: true });
+  connectFirestoreEmulator(db, "127.0.0.1", 8080);
+  console.log("Using the local emulator suite (auth :9099, firestore :8080)\n");
+}
 
 /** Firestore caps a batch at 500 operations. */
 const BATCH_LIMIT = 500;
@@ -219,10 +242,105 @@ async function ensureAccount(email: string): Promise<string> {
   }
 }
 
+/**
+ * Every address the `users` collection knows about.
+ *
+ * There is no admin listUsers without a service-account key, so the profiles
+ * are the only census of the Auth records this project made. An Auth record
+ * whose profile was already deleted is invisible here and has to go in the
+ * console.
+ */
+async function knownEmails(): Promise<string[]> {
+  const snap = await getDocs(collection(db, "users"));
+  const found = snap.docs
+    .map((d) => (d.data() as { email?: string }).email)
+    .filter((e): e is string => typeof e === "string");
+  return [...new Set([...found, ...ACCOUNTS.map((a) => a.email)])];
+}
+
+/**
+ * Deletes the Auth records, by signing in as each one and asking it to remove
+ * itself — the only route the client SDK offers. Anything whose password is
+ * not one of KNOWN_PASSWORDS is reported rather than silently skipped, because
+ * a half-cleared Auth list is worse than one you know the shape of.
+ */
+async function purgeAuth(emails: string[]): Promise<void> {
+  console.log("\nDeleting Auth accounts:");
+  const stubborn: string[] = [];
+  for (const email of emails) {
+    let done = false;
+    for (const pw of KNOWN_PASSWORDS) {
+      try {
+        const cred = await signInWithEmailAndPassword(auth, email, pw);
+        await deleteUser(cred.user);
+        console.log(`  - ${email} deleted`);
+        done = true;
+        break;
+      } catch {
+        // Wrong password, or the record is already gone. Try the next one.
+      }
+    }
+    if (!done) {
+      stubborn.push(email);
+      console.log(`  ! ${email} could not be signed into — left in place`);
+    }
+  }
+  if (stubborn.length > 0) {
+    console.log(
+      `\n  ${stubborn.length} account(s) need a password this script does ` +
+        `not have.\n  Delete them by hand under Authentication → Users:\n` +
+        `  https://console.firebase.google.com/project/${env.NEXT_PUBLIC_FIREBASE_PROJECT_ID}/authentication/users`,
+    );
+  }
+}
+
 async function main(): Promise<void> {
   console.log(
     `Setting up ${env.NEXT_PUBLIC_FIREBASE_PROJECT_ID}${DRY_RUN ? " (dry run)" : ""}\n`,
   );
+
+  // The wipe runs before the accounts are made, not after: --reset-auth
+  // deletes the very records the account step would otherwise have just
+  // created, and reading the `users` collection for the address list has to
+  // happen while those documents still exist.
+  if (RESET && !DRY_RUN) {
+    if (!process.argv.includes("--yes")) {
+      const ok = await confirm(
+        `Delete EVERY document in ${env.NEXT_PUBLIC_FIREBASE_PROJECT_ID}` +
+          `${RESET_AUTH ? ", and every Auth account it can sign into" : ""}?`,
+      );
+      if (!ok) {
+        console.log("Nothing was deleted.");
+        process.exit(0);
+      }
+    }
+
+    // Clearing needs a signed-in session, so borrow the CEO's if it is there.
+    // A project with no account yet has nothing to clear either.
+    let emails: string[] = ACCOUNTS.map((a) => a.email);
+    try {
+      await signInWithEmailAndPassword(auth, ACCOUNTS[0].email, PASSWORD);
+      if (RESET_AUTH) emails = await knownEmails();
+      console.log("\nClearing:");
+      for (const parent of WITH_PHOTOS) await clearPhotos(parent);
+      for (const name of ALL_COLLECTIONS) await clear(name);
+    } catch {
+      console.log("\n  Nothing to clear — no account to sign in with yet.");
+    }
+
+    if (RESET_AUTH) {
+      await purgeAuth(emails);
+      await signOut(auth).catch(() => {});
+    } else {
+      console.log(
+        "\n  Auth accounts are NOT deleted — the client SDK cannot remove\n" +
+          "  another user's record. They will sign in and land on 'no profile'\n" +
+          "  until the accounts below are recreated. Pass --reset-auth to\n" +
+          "  delete the ones this script can sign into, or clear them all at:\n" +
+          `  https://console.firebase.google.com/project/${env.NEXT_PUBLIC_FIREBASE_PROJECT_ID}/authentication/users`,
+      );
+    }
+  }
 
   console.log("Accounts:");
   if (DRY_RUN) {
@@ -238,6 +356,13 @@ async function main(): Promise<void> {
 
     await signInWithEmailAndPassword(auth, ACCOUNTS[0].email, PASSWORD);
     for (const [i, a] of ACCOUNTS.entries()) {
+      // Nobody sets their own role, so the CEO cannot rewrite the profile they
+      // are signed in as. On a re-run it is already correct; on a first run it
+      // has to be seeded before the rules are live. Either way, skip it.
+      if (i === 0 && (await getDoc(doc(db, "users", uids[0]))).exists()) {
+        console.log(`  · ${a.email.padEnd(26)} own profile left as it is`);
+        continue;
+      }
       await setDoc(
         doc(db, "users", uids[i]),
         {
@@ -253,27 +378,6 @@ async function main(): Promise<void> {
       );
       console.log(`  · ${a.email.padEnd(26)} profile written as ${a.role}`);
     }
-  }
-
-  if (RESET) {
-    if (!process.argv.includes("--yes")) {
-      const ok = await confirm(
-        `Delete EVERY document in ${env.NEXT_PUBLIC_FIREBASE_PROJECT_ID}?`,
-      );
-      if (!ok) {
-        console.log("Nothing was deleted.");
-        process.exit(0);
-      }
-    }
-    console.log("\nClearing:");
-    for (const parent of WITH_PHOTOS) await clearPhotos(parent);
-    for (const name of ALL_COLLECTIONS) await clear(name);
-    console.log(
-      "\n  Auth accounts are NOT deleted — the client SDK cannot remove another\n" +
-        "  user's record. They will sign in and land on 'no profile' until the\n" +
-        "  accounts below are recreated. To clear them entirely:\n" +
-        `  https://console.firebase.google.com/project/${env.NEXT_PUBLIC_FIREBASE_PROJECT_ID}/authentication/users`,
-    );
   }
 
   console.log(`\n${DRY_RUN ? "Would write:" : "Writing:"}`);

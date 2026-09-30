@@ -1,8 +1,10 @@
 # Application flow and use cases
 
-Companion to [`application-flow.drawio`](./application-flow.drawio) — four UML
-pages: session and navigation, the request lifecycle, use cases by role, and
-the affordance/enforcement layers.
+Companion to [`application-flow.drawio`](./application-flow.drawio) — six
+pages: session and navigation, the request lifecycle, **use cases by role**,
+the affordance/enforcement layers, a **system flowchart** (a session starting,
+the request lifecycle, what happens to any write, and a reading becoming a
+status) and the **entity relationships** across the eleven collections.
 
 Every row below is traceable to a predicate in
 [`src/lib/permissions.ts`](../src/lib/permissions.ts). Nothing here describes
@@ -18,7 +20,7 @@ as being usable here. You land on a shell whose sidebar is filtered to your
 rank, scoped to one building if you are Office Staff and to the whole estate
 otherwise. You act: raise a request, move one along, set a unit's condition,
 reset an alarm, edit the estate. **Every action writes a Log Book entry**, and
-because all nine collections are live `onSnapshot` subscriptions, the change
+because all eleven collections are live `onSnapshot` subscriptions, the change
 appears on every other page and in every other open tab at once. Sign out and
 the data stays; it is Firestore, not session state.
 
@@ -128,20 +130,24 @@ It runs in the browser, and **it stops nothing**. The route guard in
 dashboard while signed out, not to protect anything.
 
 The layer that can actually refuse a write is `firestore.rules`, because it
-runs on Google's servers — and in this build **it is at the wide-open default
-and is not deployed**. Anyone holding the API key, which is public and sits in
-the bundle, can read and write all nine collections directly, whatever this
-document says about roles.
+runs on Google's servers. It is **deployed and covers all eleven
+collections**, and the matrix above is verified against the emulator rather
+than asserted: Office Staff are denied `reports` and the `users` collection,
+denied every write to `buildings`, `rooms` and `sensors`, denied
+decommissioning a unit and denied advancing a request — while still able to
+mark a unit faulty, withdraw their own unapproved request and flag their own
+resolved work.
 
-That was a deliberate scope decision for the coursework, not an oversight. It
-is recorded here because a role matrix presented as *security* would be
-overclaiming: every constraint on the pages above is real, and every one of
-them is a client-side constraint. Deploying the rules means mirroring this
-matrix server-side, and when a `can*` predicate changes the matching rule
-belongs in the same commit.
+So the two layers say the same thing twice, on purpose, and they have to keep
+agreeing: when a `can*` predicate changes, the matching rule belongs in the
+same commit. Where they disagree the SDK throws `permission-denied`, and
+`(app)/error.tsx` treats that as the app working — a 403 with no retry, not a
+crash. A collection a role may not read would answer its subscription the same
+way, which is why `useLiveCollection` takes an `enabled` flag and
+`useReports(canAccessReports(role))` is the one subscription app-state holds
+for a page its role cannot reach.
 
-One consequence worth knowing: **suspension already works through the rules
-rather than through the app.** A suspended account's own profile read is
-refused, and `lib/auth.tsx` turns that `permission-denied` into a sign-out. It
-is the one place the enforcement layer is already load-bearing, and it looks
-like a bug if you do not know that.
+One consequence worth knowing: **suspension works through the rules rather
+than through the app.** A suspended account's own profile read is refused, and
+`lib/auth.tsx` turns that `permission-denied` into a sign-out. It looks like a
+bug if you do not know that.
